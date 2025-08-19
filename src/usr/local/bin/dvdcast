@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---- Config (override via env) ----
+DEVICE="${DEVICE:-}"              # leave empty → auto-detect (/dev/sr1, /dev/sr0, /dev/dvd)
+TITLE="${TITLE:-auto}"            # "auto" = pick longest via lsdvd
+NET_CACHE="${NET_CACHE:-2000}"    # ms
+FILE_CACHE="${FILE_CACHE:-2000}"  # ms
+CC_IP="${CC_IP:-}"                # pin Chromecast IP (optional)
+USE_CATT_STOP="${USE_CATT_STOP:-1}"   # 1=send 'catt stop' beforehand if catt exists
+V_BITRATE="${V_BITRATE:-1500}"    # kbps for h264 video
+A_BITRATE="${A_BITRATE:-192}"     # kbps for AAC audio
+A_RATE="${A_RATE:-44100}"         # Hz
+A_CH="${A_CH:-2}"                 # channels
+# -----------------------------------
+
+die(){ echo "❌ $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+need(){ have "$1" || die "Missing dependency: $1"; }
+
+need avahi-browse
+need cvlc
+need lsdvd
+
+# --- Chromecast discovery (unless CC_IP provided) ---
+if [[ -z "${CC_IP}" ]]; then
+  mapfile -t found < <(
+    avahi-browse -rt _googlecast._tcp 2>/dev/null |
+    awk '
+      /^= /     { chrom = ($0 ~ /Chromecast/); host=""; ip="" }
+      /hostname = \[/ { if (chrom) { host=$3; gsub(/[\[\]]/,"",host) } }
+      /address = \[/  { if (chrom) { ip=$3;   gsub(/[\[\]]/,"",ip); print host "|" ip } }
+    ' | sort -u
+  )
+  ((${#found[@]})) || die "No Chromecast found on LAN."
+  sel="${found[0]}"
+  if ((${#found[@]} > 1)); then
+    echo "Multiple Chromecasts:"; i=1
+    for row in "${found[@]}"; do IFS="|" read -r h ip <<<"$row"; echo "  $i) $h ($ip)"; ((i++)); done
+    read -r -p "Choose [1-${#found[@]}]: " pick
+    [[ "$pick" =~ ^[0-9]+$ && "$pick" -ge 1 && "$pick" -le ${#found[@]} ]] || die "Invalid choice."
+    sel="${found[$((pick-1))]}"
+  fi
+  IFS="|" read -r CC_HOST CC_IP <<<"$sel"
+else
+  CC_HOST="$CC_IP"
+fi
+echo "✅ Chromecast: $CC_HOST ($CC_IP)"
+
+# --- Auto-detect DVD device if not provided ---
+if [[ -z "${DEVICE}" ]]; then
+  CANDIDATES=(/dev/sr1 /dev/sr0 /dev/dvd)
+  while read -r name type; do
+    [[ "$type" == "rom" || "$type" == "sr" ]] && CANDIDATES+=("/dev/$name")
+  done < <(lsblk -ndo NAME,TYPE)
+  for d in "${CANDIDATES[@]}"; do
+    [[ -e "$d" ]] || continue
+    if have udevadm && udevadm info --query=property --name="$d" 2>/dev/null | grep -q '^ID_CDROM=1'; then
+      DEVICE="$d"; break
+    fi
+  done
+fi
+[[ -n "${DEVICE}" && -e "$DEVICE" ]] || die "No DVD drive found. Try: DEVICE=/dev/sr1 $0"
+echo "📀 Using DVD device: $DEVICE"
+
+# --- Preflight: readable disc & longest title selection ---
+if ! lsdvd "$DEVICE" >/tmp/lsdvd.out 2>/tmp/lsdvd.err; then
+  echo "⚠️  lsdvd could not read the disc in $DEVICE."
+  echo "   • Tray empty or unreadable"
+  echo "   • Region not set (sudo regionset $DEVICE)"
+  echo "   • libdvdcss missing (sudo apt install libdvd-pkg && sudo dpkg-reconfigure libdvd-pkg)"
+  echo "----- lsdvd stderr -----"; sed -e 's/^/  /' /tmp/lsdvd.err; exit 1
+fi
+
+if [[ "$TITLE" == "auto" ]]; then
+  TITLE="$(
+    awk '
+      # Lines like:  Title: 01, Length: 01:34:11.133 Chapters: ...
+      /^Title:/ {
+        t = $2; gsub(/,/, "", t)        # title number, strip trailing comma
+        len = ""
+        for (i=1; i<=NF; i++) if ($i=="Length:") { len=$(i+1); break }
+        if (len!="") {
+          split(len,a,":")
+          sec = (a[1]+0)*3600 + (a[2]+0)*60 + (a[3]+0)
+          if (sec > max) { max=sec; pick=t }
+        }
+      }
+      END { if (pick=="") exit 1; print pick }
+    ' /tmp/lsdvd.out || true
+  )"
+  [[ -n "$TITLE" ]] || die "Could not auto-select title from lsdvd."
+fi
+echo "🎞️  Selected Title: $TITLE"
+
+# --- Ensure Chromecast is idle (optional) ---
+if [[ "${USE_CATT_STOP}" == "1" ]] && have catt; then
+  catt -d "$CC_IP" stop >/dev/null 2>&1 || true
+fi
+
+# --- Cast with VLC 3.x: transcode → chromecast ---
+# Forces h264/aac so Chromecast plays instead of buffering.
+SOUT="#transcode{vcodec=h264,vb=${V_BITRATE},acodec=mp4a,ab=${A_BITRATE},channels=${A_CH},samplerate=${A_RATE}}:chromecast{ip=${CC_IP}}"
+
+echo "▶ Casting via VLC…"
+exec cvlc -vvv \
+  --no-video-title-show \
+  --network-caching="$NET_CACHE" \
+  --file-caching="$FILE_CACHE" \
+  --sout "$SOUT" \
+  "dvdsimple://$DEVICE#${TITLE}"
+
